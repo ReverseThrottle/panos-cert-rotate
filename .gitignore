@@ -1,0 +1,28 @@
+# Secrets
+.env
+
+# Certs and keys — never commit real material
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
