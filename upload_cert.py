@@ -219,14 +219,23 @@ class PanosClient:
         self._check_status(root, f"edit config {xpath}")
         time.sleep(self.SET_CALL_DELAY_S)
 
-    def cert_exists(self, vsys_xpath: str, cert_name: str) -> bool:
+    def cert_exists(self, cert_name: str) -> bool:
+        dev_base = "/config/devices/entry[@name='localhost.localdomain']"
         safe_name = _xpath_str(cert_name)
-        xpath = f"{vsys_xpath}/certificate/entry[@name='{safe_name}']"
-        try:
-            root = self._get({"type": "config", "action": "get", "xpath": xpath})
-            return root.get("status") == "success" and root.find(".//entry") is not None
-        except Exception:
-            return False
+        xpaths = [
+            f"{dev_base}/vsys/entry[@name='vsys1']/certificate/entry[@name='{safe_name}']",
+            f"/config/shared/certificate/entry[@name='{safe_name}']",
+        ]
+        for xpath in xpaths:
+            try:
+                root = self._get({"type": "config", "action": "get", "xpath": xpath})
+                if root.get("status") == "success" and root.find(".//entry") is not None:
+                    return True
+            except PanosAuthError:
+                raise
+            except Exception:
+                pass
+        return False
 
     # ------------------------------------------------------------------
     # Import
@@ -779,10 +788,8 @@ def main():
 
     try:
         # --- Check if new-name already exists ---
-        dev_base = "/config/devices/entry[@name='localhost.localdomain']"
-        vsys_base = f"{dev_base}/vsys/entry[@name='vsys1']"
         if not args.dry_run:
-            exists = client.cert_exists(vsys_base, args.new_name)
+            exists = client.cert_exists(args.new_name)
             if exists and not args.force_overwrite:
                 raise SystemExit(
                     f"ERROR: A certificate named '{args.new_name}' already exists on the firewall. "
