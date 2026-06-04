@@ -554,7 +554,6 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         "gp": [],                  # list of {vsys, label, set_xpath}
         "ssl_decrypt": [],         # list of {vsys, label, set_xpath}
         "device_mgmt": None,       # set_xpath or None
-        "cert_profiles": [],       # list of {scope, vsys, name, ca_names, entry_xpath}
     }
 
     multi_vsys = client.is_multi_vsys()
@@ -735,7 +734,6 @@ def main():
             len(refs["cert_profiles"]) +
             len(refs["gp"]) +
             len(refs["ssl_decrypt"]) +
-            len(refs["cert_profiles"]) +
             (1 if refs["device_mgmt"] else 0)
         )
 
@@ -748,8 +746,6 @@ def main():
             logger.info("  GlobalProtect [vsys/%s] %s", r["vsys"], r["label"])
         for r in refs["ssl_decrypt"]:
             logger.info("  SSL Decrypt [vsys/%s] %s", r["vsys"], r["label"])
-        for r in refs["cert_profiles"]:
-            logger.info("  Certificate profile [%s] '%s'", r["scope"], r["name"])
         if refs["device_mgmt"]:
             logger.info("  Device management SSL profile")
         if total_refs == 0:
@@ -818,16 +814,6 @@ def main():
                 client.set_config(r["set_xpath"], cert_element)
                 remapped.append(r["set_xpath"])
                 logger.info("Remapped SSL decrypt field %s.", r["label"])
-
-            for r in refs["cert_profiles"]:
-                new_ca_names = [args.new_name if n == args.old_name else n for n in r["ca_names"]]
-                ca_el = ET.Element("CA")
-                for n in new_ca_names:
-                    e = ET.SubElement(ca_el, "entry")
-                    e.set("name", saxutils.escape(n))
-                client.set_config(r["entry_xpath"], ET.tostring(ca_el, encoding="unicode"))
-                remapped.append(r["entry_xpath"])
-                logger.info("Remapped certificate profile [%s] '%s'.", r["scope"], r["name"])
 
             if refs["device_mgmt"]:
                 client.set_config(refs["device_mgmt"], cert_element)
