@@ -448,7 +448,7 @@ class PanosClient:
     # ------------------------------------------------------------------
 
     def validate_commit(self, admin: str | None = None, timeout_s: int = 300) -> None:
-        cmd = self._build_commit_cmd(validate=True, admin=admin)
+        cmd = self._build_commit_cmd(admin=admin)
         root = self._get({"type": "commit", "action": "validate", "cmd": cmd})
         self._check_status(root, "commit validate")
         job_id = self._extract_job_id(root)
@@ -457,7 +457,7 @@ class PanosClient:
         self._logger.info("Pre-commit validation passed.")
 
     def commit(self, admin: str | None = None, timeout_s: int = 300) -> str:
-        cmd = self._build_commit_cmd(validate=False, admin=admin)
+        cmd = self._build_commit_cmd(admin=admin)
         root = self._post({"type": "commit", "cmd": cmd})
         self._check_status(root, "commit")
         job_id = self._extract_job_id(root)
@@ -466,14 +466,10 @@ class PanosClient:
         self._logger.info("Commit job %s started.", job_id)
         return self._poll_job(job_id, "commit", timeout_s=timeout_s)
 
-    def _build_commit_cmd(self, validate: bool, admin: str | None) -> str:
+    def _build_commit_cmd(self, admin: str | None) -> str:
         if admin:
-            inner = f"<partial><admin><member>{saxutils.escape(admin)}</member></admin></partial>"
-        else:
-            inner = ""
-        if validate:
-            return f"<commit><partial>{inner}</partial></commit>" if admin else "<commit/>"
-        return f"<commit>{inner}</commit>"
+            return f"<commit><partial><admin><member>{saxutils.escape(admin)}</member></admin></partial></commit>"
+        return "<commit/>"
 
     def _extract_job_id(self, root: ET.Element) -> str | None:
         el = root.find(".//job")
