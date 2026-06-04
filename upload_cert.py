@@ -286,30 +286,11 @@ class PanosClient:
                     matches.append(name)
         return matches
 
-    def find_cert_profile_refs(self, xpath: str, old_cert: str) -> list[dict]:
-        """Return list of {name, ca_names} for certificate-profiles containing old_cert in their CA list."""
-        try:
-            root = self.get_config(xpath)
-        except PanosError:
-            return []
-        matches = []
-        for entry in root.findall(".//entry"):
-            name = entry.get("name")
-            if not name:
-                continue
-            ca_el = entry.find("CA")
-            if ca_el is None:
-                continue
-            ca_names = [e.get("name") for e in ca_el.findall("entry") if e.get("name")]
-            if old_cert in ca_names:
-                matches.append({"name": name, "ca_names": ca_names})
-        return matches
-
     def find_gp_refs(self, vsys: str, old_cert: str) -> list[tuple[str, str]]:
         """Return list of (type_label, xpath_to_set) for GP gateway/portal cert refs."""
         base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{saxutils.escape(vsys)}']"
         hits = []
-        for gp_type in ("global-protect-gateway/entry", "global-protect-portal/entry"):
+        for gp_type in ("global-protect/global-protect-gateway/entry", "global-protect/global-protect-portal/entry"):
             try:
                 root = self.get_config(f"{base}/{gp_type}")
             except PanosError:
@@ -320,6 +301,38 @@ class PanosClient:
                     if ssl_el.text == old_cert:
                         full_xpath = f"{base}/{gp_type}[@name='{saxutils.escape(gw_name)}']/ssl-tls-service-profile"
                         hits.append((f"{gp_type}/{gw_name}", full_xpath))
+        return hits
+
+    def find_gp_cookie_refs(self, vsys: str, old_cert: str) -> list[dict]:
+        """Return list of {vsys, label, set_xpath} for GP cookie-encrypt-decrypt-cert refs.
+
+        The set_xpath points to the <authentication-override> parent so that
+        action=set with element <cookie-encrypt-decrypt-cert>...</cookie-encrypt-decrypt-cert>
+        replaces the text value correctly.
+        """
+        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{saxutils.escape(vsys)}']"
+        hits = []
+        for gp_type in ("global-protect/global-protect-portal/entry", "global-protect/global-protect-gateway/entry"):
+            try:
+                root = self.get_config(f"{base}/{gp_type}")
+            except PanosError:
+                continue
+            for entry in root.findall(".//entry"):
+                gp_name = entry.get("name", "")
+                for cfg_entry in entry.findall(".//client-config/configs/entry"):
+                    cfg_name = cfg_entry.get("name", "")
+                    for cookie_el in cfg_entry.findall("authentication-override/cookie-encrypt-decrypt-cert"):
+                        if cookie_el.text == old_cert:
+                            auth_xpath = (
+                                f"{base}/{gp_type}[@name='{saxutils.escape(gp_name)}']"
+                                f"/client-config/configs/entry[@name='{saxutils.escape(cfg_name)}']"
+                                f"/authentication-override"
+                            )
+                            hits.append({
+                                "vsys": vsys,
+                                "label": f"{gp_type}/{gp_name}/config/{cfg_name}",
+                                "set_xpath": auth_xpath,
+                            })
         return hits
 
     def find_decrypt_refs(self, vsys: str, old_cert: str) -> list[tuple[str, str]]:
@@ -336,6 +349,28 @@ class PanosClient:
                         hits.append((f"ssl-decrypt/{field}", f"{base}/{field}"))
             except PanosError:
                 pass
+        return hits
+
+    def find_shared_decrypt_refs(self, old_cert: str) -> list[dict]:
+        """Return list of {label, set_xpath, element_tag} for shared ssl-decrypt forward-trust cert refs.
+
+        PAN-OS 11.x stores these under /config/shared/ssl-decrypt/forward-trust-certificate
+        with nested <rsa> and <ecdsa> children (not flat hyphenated names).
+        """
+        base = "/config/shared/ssl-decrypt/forward-trust-certificate"
+        hits = []
+        try:
+            root = self.get_config(base)
+        except PanosError:
+            return hits
+        for tag in ("rsa", "ecdsa"):
+            el = root.find(f".//{tag}")
+            if el is not None and el.text == old_cert:
+                hits.append({
+                    "label": f"shared/ssl-decrypt/forward-trust-certificate/{tag}",
+                    "set_xpath": base,
+                    "element_tag": tag,
+                })
         return hits
 
     def find_cert_profile_refs(self, xpath: str, old_cert: str) -> list[dict]:
@@ -552,7 +587,9 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         "ssl_tls_profiles": [],   # list of {scope, vsys, name, set_xpath}
         "cert_profiles": [],       # list of {scope, vsys, name, ca_names, entry_xpath}
         "gp": [],                  # list of {vsys, label, set_xpath}
+        "gp_cookie": [],           # list of {vsys, label, set_xpath} — cookie-encrypt-decrypt-cert
         "ssl_decrypt": [],         # list of {vsys, label, set_xpath}
+        "shared_ssl_decrypt": [],  # list of {label, set_xpath, element_tag} — shared forward-trust
         "device_mgmt": None,       # set_xpath or None
     }
 
@@ -601,9 +638,9 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         for label, set_xpath in client.find_decrypt_refs(vsys, old_name):
             refs["ssl_decrypt"].append({"vsys": vsys, "label": label, "set_xpath": set_xpath})
 
-        # Certificate profiles (vsys)
-        for r in client.find_cert_profile_refs(f"{vsys_base}/certificate-profile", old_name):
-            refs["cert_profiles"].append({"scope": f"vsys/{vsys}", "vsys": vsys, **r})
+        # GP cookie-encrypt-decrypt-cert
+        for r in client.find_gp_cookie_refs(vsys, old_name):
+            refs["gp_cookie"].append(r)
 
     # Shared SSL/TLS profiles
     shared_xpath = "/config/shared/ssl-tls-service-profile"
@@ -620,6 +657,10 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
     # Shared certificate profiles
     for r in client.find_cert_profile_refs("/config/shared/certificate-profile", old_name):
         refs["cert_profiles"].append({"scope": "shared", "vsys": None, **r})
+
+    # Shared SSL decrypt forward-trust certificates
+    for r in client.find_shared_decrypt_refs(old_name):
+        refs["shared_ssl_decrypt"].append(r)
 
     # Device management cert
     mgmt_xpath = client.find_device_mgmt_ref(old_name)
@@ -733,7 +774,9 @@ def main():
             len(refs["ssl_tls_profiles"]) +
             len(refs["cert_profiles"]) +
             len(refs["gp"]) +
+            len(refs["gp_cookie"]) +
             len(refs["ssl_decrypt"]) +
+            len(refs["shared_ssl_decrypt"]) +
             (1 if refs["device_mgmt"] else 0)
         )
 
@@ -744,8 +787,12 @@ def main():
             logger.info("  Certificate profile [%s] '%s' (CA list: %s)", r["scope"], r["name"], r["ca_names"])
         for r in refs["gp"]:
             logger.info("  GlobalProtect [vsys/%s] %s", r["vsys"], r["label"])
+        for r in refs["gp_cookie"]:
+            logger.info("  GP cookie cert [vsys/%s] %s", r["vsys"], r["label"])
         for r in refs["ssl_decrypt"]:
             logger.info("  SSL Decrypt [vsys/%s] %s", r["vsys"], r["label"])
+        for r in refs["shared_ssl_decrypt"]:
+            logger.info("  Shared SSL decrypt %s", r["label"])
         if refs["device_mgmt"]:
             logger.info("  Device management SSL profile")
         if total_refs == 0:
@@ -810,10 +857,24 @@ def main():
                 remapped.append(r["set_xpath"])
                 logger.info("Remapped GlobalProtect %s.", r["label"])
 
+            for r in refs["gp_cookie"]:
+                cookie_el = ET.Element("cookie-encrypt-decrypt-cert")
+                cookie_el.text = args.new_name
+                client.set_config(r["set_xpath"], ET.tostring(cookie_el, encoding="unicode"))
+                remapped.append(r["set_xpath"])
+                logger.info("Remapped GP cookie cert %s.", r["label"])
+
             for r in refs["ssl_decrypt"]:
                 client.set_config(r["set_xpath"], cert_element)
                 remapped.append(r["set_xpath"])
                 logger.info("Remapped SSL decrypt field %s.", r["label"])
+
+            for r in refs["shared_ssl_decrypt"]:
+                tag_el = ET.Element(r["element_tag"])
+                tag_el.text = args.new_name
+                client.set_config(r["set_xpath"], ET.tostring(tag_el, encoding="unicode"))
+                remapped.append(r["set_xpath"])
+                logger.info("Remapped shared SSL decrypt %s.", r["label"])
 
             if refs["device_mgmt"]:
                 client.set_config(refs["device_mgmt"], cert_element)
