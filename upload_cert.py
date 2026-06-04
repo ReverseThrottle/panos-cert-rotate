@@ -803,7 +803,7 @@ def main():
                 ca_el = ET.Element("CA")
                 for n in new_ca_names:
                     e = ET.SubElement(ca_el, "entry")
-                    e.set("name", saxutils.escape(n))
+                    e.set("name", n)
                 ca_xpath = r["entry_xpath"] + "/CA"
                 client.edit_config(ca_xpath, ET.tostring(ca_el, encoding="unicode"))
                 remapped.append(r["entry_xpath"])
