@@ -352,25 +352,28 @@ class PanosClient:
         return hits
 
     def find_shared_decrypt_refs(self, old_cert: str) -> list[dict]:
-        """Return list of {label, set_xpath, element_tag} for shared ssl-decrypt forward-trust cert refs.
+        """Return list of {label, set_xpath, element_tag} for shared ssl-decrypt cert refs.
 
-        PAN-OS 11.x stores these under /config/shared/ssl-decrypt/forward-trust-certificate
+        PAN-OS 11.x stores these under /config/shared/ssl-decrypt/<cert_type>
         with nested <rsa> and <ecdsa> children (not flat hyphenated names).
+        Covers both forward-trust-certificate and forward-untrust-certificate.
         """
-        base = "/config/shared/ssl-decrypt/forward-trust-certificate"
+        base = "/config/shared/ssl-decrypt"
         hits = []
-        try:
-            root = self.get_config(base)
-        except PanosError:
-            return hits
-        for tag in ("rsa", "ecdsa"):
-            el = root.find(f".//{tag}")
-            if el is not None and el.text == old_cert:
-                hits.append({
-                    "label": f"shared/ssl-decrypt/forward-trust-certificate/{tag}",
-                    "set_xpath": base,
-                    "element_tag": tag,
-                })
+        for cert_type in ("forward-trust-certificate", "forward-untrust-certificate"):
+            xpath = f"{base}/{cert_type}"
+            try:
+                root = self.get_config(xpath)
+            except PanosError:
+                continue
+            for tag in ("rsa", "ecdsa"):
+                el = root.find(f".//{tag}")
+                if el is not None and el.text == old_cert:
+                    hits.append({
+                        "label": f"shared/ssl-decrypt/{cert_type}/{tag}",
+                        "set_xpath": xpath,
+                        "element_tag": tag,
+                    })
         return hits
 
     def find_cert_profile_refs(self, xpath: str, old_cert: str) -> list[dict]:
@@ -589,7 +592,7 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         "gp": [],                  # list of {vsys, label, set_xpath}
         "gp_cookie": [],           # list of {vsys, label, set_xpath} — cookie-encrypt-decrypt-cert
         "ssl_decrypt": [],         # list of {vsys, label, set_xpath}
-        "shared_ssl_decrypt": [],  # list of {label, set_xpath, element_tag} — shared forward-trust
+        "shared_ssl_decrypt": [],  # list of {label, set_xpath, element_tag} — shared forward-trust/untrust
         "device_mgmt": None,       # set_xpath or None
     }
 
@@ -658,7 +661,7 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
     for r in client.find_cert_profile_refs("/config/shared/certificate-profile", old_name):
         refs["cert_profiles"].append({"scope": "shared", "vsys": None, **r})
 
-    # Shared SSL decrypt forward-trust certificates
+    # Shared SSL decrypt forward-trust and forward-untrust certificates
     for r in client.find_shared_decrypt_refs(old_name):
         refs["shared_ssl_decrypt"].append(r)
 
