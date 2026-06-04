@@ -335,6 +335,28 @@ class PanosClient:
                 })
         return matches
 
+    def delete_certificate(self, cert_name: str) -> bool:
+        """Delete a certificate by name; searches vsys then shared scope.
+
+        Returns True if deleted, False if not found in either scope.
+        """
+        dev_base = "/config/devices/entry[@name='localhost.localdomain']"
+        safe_name = saxutils.escape(cert_name)
+        for scope, xpath in [
+            ("vsys1", f"{dev_base}/vsys/entry[@name='vsys1']/certificate/entry[@name='{safe_name}']"),
+            ("shared", f"/config/shared/certificate/entry[@name='{safe_name}']"),
+        ]:
+            try:
+                check = self._get({"type": "config", "action": "get", "xpath": xpath})
+                if check.get("status") == "success" and check.find(".//entry") is not None:
+                    root = self._get({"type": "config", "action": "delete", "xpath": xpath})
+                    self._check_status(root, f"delete certificate '{cert_name}'")
+                    self._logger.info("Certificate '%s' deleted from %s.", cert_name, scope)
+                    return True
+            except PanosError:
+                continue
+        return False
+
     def find_device_mgmt_ref(self, old_cert: str) -> str | None:
         """Return xpath if the device mgmt SSL profile references old_cert, else None."""
         xpath = "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/ssl-tls-service-profile"
@@ -586,8 +608,14 @@ def parse_args():
                    help="Passphrase for keypair import. PAN-OS 11.x requires a non-empty value even for "
                         "unencrypted keys. If omitted, a random passphrase is generated automatically.")
     p.add_argument("--dry-run", action="store_true", help="Discover and report; do not modify firewall.")
+    p.add_argument("--no-commit", action="store_true",
+                   help="Import cert and remap profiles but leave changes staged in candidate config for manual review. "
+                        "Overrides PANOS_AUTO_COMMIT env var.")
     p.add_argument("--force-overwrite", action="store_true",
                    help="Overwrite existing cert named --new-name if it already exists on the firewall.")
+    p.add_argument("--remove-old-cert", action="store_true",
+                   help="After a successful commit, delete the old cert (--old-name) from the device cert store. "
+                        "No-op in --no-commit / staged mode.")
     p.add_argument("--commit-admin", default=None,
                    help="Admin username to scope the commit to (recommended: use a service account).")
     p.add_argument("--commit-timeout", type=int, default=300, help="Max seconds to wait for commit job (default 300).")
@@ -599,6 +627,7 @@ def load_env():
     host = os.environ.get("PANOS_HOST", "").strip()
     api_key = os.environ.get("PANOS_API_KEY", "").strip()
     verify_raw = os.environ.get("PANOS_VERIFY_SSL", "false").strip().lower()
+    auto_commit_raw = os.environ.get("PANOS_AUTO_COMMIT", "true").strip().lower()
     if not host:
         raise SystemExit("ERROR: PANOS_HOST is not set.")
     if not api_key:
@@ -609,7 +638,8 @@ def load_env():
         verify_ssl = True
     else:
         verify_ssl = verify_raw  # treat as a path to a CA bundle
-    return host, api_key, verify_ssl
+    auto_commit = auto_commit_raw not in ("false", "0", "no")
+    return host, api_key, verify_ssl, auto_commit
 
 
 def main():
@@ -619,7 +649,13 @@ def main():
     if log_file:
         logger.info("Audit log: %s", log_file)
 
-    logger.info("Mode: %s", "DRY RUN" if args.dry_run else "LIVE")
+    # --no-commit flag overrides PANOS_AUTO_COMMIT env var
+    host, api_key, verify_ssl, auto_commit = load_env()
+    if args.no_commit:
+        auto_commit = False
+
+    mode = "DRY RUN" if args.dry_run else ("STAGED" if not auto_commit else "LIVE")
+    logger.info("Mode: %s", mode)
     logger.info("old-name=%s  new-name=%s  cert=%s  key=%s",
                 args.old_name, args.new_name, args.cert, args.key or "(none)")
 
@@ -631,8 +667,6 @@ def main():
 
     validate_cert_and_key(args.cert, args.key, logger)
 
-    # --- Load env ---
-    host, api_key, verify_ssl = load_env()
     client = PanosClient(host, api_key, verify_ssl, logger)
 
     try:
@@ -741,21 +775,47 @@ def main():
                 remapped.append(refs["device_mgmt"])
                 logger.info("Remapped device management SSL profile.")
 
-            # --- Pre-commit validation ---
-            logger.info("Running pre-commit validation...")
-            client.validate_commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
+            if not auto_commit:
+                # --- Staged mode: leave candidate config for manual review ---
+                logger.info("--- Staged (PANOS_AUTO_COMMIT=false / --no-commit) ---")
+                logger.info("Certificate imported: '%s' (with key: %s)", args.new_name, "yes" if args.key else "no")
+                logger.info("Profiles remapped: %d", len(remapped))
+                logger.info("Pre-change snapshot on device: '%s'", snapshot_name)
+                logger.info(
+                    "Changes are staged in candidate config. Review in PAN-OS GUI "
+                    "(Monitor > Commit > Preview) then commit manually."
+                )
+                if args.remove_old_cert:
+                    logger.warning(
+                        "--remove-old-cert has no effect in staged mode. "
+                        "Delete '%s' manually after you commit.", args.old_name
+                    )
+                if log_file:
+                    logger.info("Full audit log: %s", log_file)
+            else:
+                # --- Auto-commit mode ---
+                logger.info("Running pre-commit validation...")
+                client.validate_commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
 
-            # --- Commit ---
-            logger.info("Committing...")
-            job_id = client.commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
+                logger.info("Committing...")
+                job_id = client.commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
 
-            logger.info("--- Summary ---")
-            logger.info("Certificate imported: '%s' (with key: %s)", args.new_name, "yes" if args.key else "no")
-            logger.info("Profiles remapped: %d", len(remapped))
-            logger.info("Commit job ID: %s", job_id)
-            logger.info("Pre-change snapshot on device: '%s'", snapshot_name)
-            if log_file:
-                logger.info("Full audit log: %s", log_file)
+                logger.info("--- Summary ---")
+                logger.info("Certificate imported: '%s' (with key: %s)", args.new_name, "yes" if args.key else "no")
+                logger.info("Profiles remapped: %d", len(remapped))
+                logger.info("Commit job ID: %s", job_id)
+                logger.info("Pre-change snapshot on device: '%s'", snapshot_name)
+                if log_file:
+                    logger.info("Full audit log: %s", log_file)
+
+                if args.remove_old_cert:
+                    logger.info("Removing old certificate '%s' from device...", args.old_name)
+                    found = client.delete_certificate(args.old_name)
+                    if not found:
+                        logger.warning(
+                            "Old certificate '%s' not found in vsys1 or shared — may have already been removed.",
+                            args.old_name,
+                        )
 
         except (PanosError, Exception) as e:
             logger.error("ERROR during live run: %s", e)
