@@ -310,23 +310,6 @@ class PanosClient:
                     matches.append(name)
         return matches
 
-    def find_gp_refs(self, vsys: str, old_cert: str) -> list[tuple[str, str]]:
-        """Return list of (type_label, xpath_to_set) for GP gateway/portal cert refs."""
-        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{_xpath_str(vsys)}']"
-        hits = []
-        for gp_type in ("global-protect/global-protect-gateway/entry", "global-protect/global-protect-portal/entry"):
-            try:
-                root = self.get_config(f"{base}/{gp_type}")
-            except PanosError:
-                continue
-            for entry in root.findall(".//entry"):
-                gw_name = entry.get("name", "")
-                for ssl_el in entry.findall(".//ssl-tls-service-profile"):
-                    if ssl_el.text == old_cert:
-                        full_xpath = f"{base}/{gp_type}[@name='{_xpath_str(gw_name)}']/ssl-tls-service-profile"
-                        hits.append((f"{gp_type}/{gw_name}", full_xpath))
-        return hits
-
     def find_gp_cookie_refs(self, vsys: str, old_cert: str) -> list[dict]:
         """Return list of {vsys, label, set_xpath} for GP cookie-encrypt-decrypt-cert refs.
 
@@ -624,7 +607,6 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
     refs = {
         "ssl_tls_profiles": [],   # list of {scope, vsys, name, set_xpath}
         "cert_profiles": [],       # list of {scope, vsys, name, ca_names, entry_xpath}
-        "gp": [],                  # list of {vsys, label, set_xpath}
         "gp_cookie": [],           # list of {vsys, label, set_xpath} — cookie-encrypt-decrypt-cert
         "ssl_decrypt": [],         # list of {vsys, label, set_xpath}
         "shared_ssl_decrypt": [],  # list of {label, set_xpath, element_tag} — shared forward-trust/untrust
@@ -670,10 +652,6 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
                 "ca_names": r["ca_names"],
                 "entry_xpath": f"{cp_xpath}/entry[@name='{safe_n}']",
             })
-
-        # GlobalProtect
-        for label, set_xpath in client.find_gp_refs(vsys, old_name):
-            refs["gp"].append({"vsys": vsys, "label": label, "set_xpath": set_xpath})
 
         # SSL decryption
         for label, set_xpath in client.find_decrypt_refs(vsys, old_name):
@@ -813,7 +791,6 @@ def main():
         total_refs = (
             len(refs["ssl_tls_profiles"]) +
             len(refs["cert_profiles"]) +
-            len(refs["gp"]) +
             len(refs["gp_cookie"]) +
             len(refs["ssl_decrypt"]) +
             len(refs["shared_ssl_decrypt"]) +
@@ -825,8 +802,6 @@ def main():
             logger.info("  SSL/TLS profile [%s] '%s'", r["scope"], r["name"])
         for r in refs["cert_profiles"]:
             logger.info("  Certificate profile [%s] '%s' (CA list: %s)", r["scope"], r["name"], r["ca_names"])
-        for r in refs["gp"]:
-            logger.info("  GlobalProtect [vsys/%s] %s", r["vsys"], r["label"])
         for r in refs["gp_cookie"]:
             logger.info("  GP cookie cert [vsys/%s] %s", r["vsys"], r["label"])
         for r in refs["ssl_decrypt"]:
@@ -891,11 +866,6 @@ def main():
                 client.edit_config(ca_xpath, ET.tostring(ca_el, encoding="unicode"))
                 remapped.append(r["entry_xpath"])
                 logger.info("Remapped certificate profile [%s] '%s'.", r["scope"], r["name"])
-
-            for r in refs["gp"]:
-                client.set_config(r["set_xpath"], cert_element)
-                remapped.append(r["set_xpath"])
-                logger.info("Remapped GlobalProtect %s.", r["label"])
 
             for r in refs["gp_cookie"]:
                 cookie_el = ET.Element("cookie-encrypt-decrypt-cert")
