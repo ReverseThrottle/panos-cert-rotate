@@ -238,15 +238,19 @@ class PanosClient:
     def import_keypair(self, cert_name: str, cert_bytes: bytes, key_bytes: bytes, passphrase: bytes = b"") -> None:
         """Import a certificate and private key together using category=keypair."""
         combined = cert_bytes + b"\n" + key_bytes
+        files: dict = {"file": ("keypair.pem", combined, "application/x-pem-file")}
+        if passphrase:
+            # Send passphrase in the multipart body so it does not appear in the
+            # request URI (and therefore not in firewall/proxy access logs).
+            files["passphrase"] = (None, passphrase.decode(), "text/plain")
         root = self._post(
             {
                 "type": "import",
                 "category": "keypair",
                 "certificate-name": cert_name,
                 "format": "pem",
-                "passphrase": passphrase.decode(),
             },
-            files={"file": ("keypair.pem", combined, "application/x-pem-file")},
+            files=files,
         )
         self._check_status(root, "import keypair")
         self._logger.info("Certificate and private key '%s' imported.", cert_name)
