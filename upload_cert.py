@@ -27,6 +27,12 @@ import xml.sax.saxutils as saxutils
 import httpx
 from dotenv import load_dotenv
 
+
+def _xpath_str(value: str) -> str:
+    """Escape a string for embedding inside a single-quoted XPath predicate."""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&apos;")
+
+
 try:
     from cryptography import x509
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -214,7 +220,7 @@ class PanosClient:
         time.sleep(self.SET_CALL_DELAY_S)
 
     def cert_exists(self, vsys_xpath: str, cert_name: str) -> bool:
-        safe_name = saxutils.escape(cert_name)
+        safe_name = _xpath_str(cert_name)
         xpath = f"{vsys_xpath}/certificate/entry[@name='{safe_name}']"
         try:
             root = self._get({"type": "config", "action": "get", "xpath": xpath})
@@ -288,7 +294,7 @@ class PanosClient:
 
     def find_gp_refs(self, vsys: str, old_cert: str) -> list[tuple[str, str]]:
         """Return list of (type_label, xpath_to_set) for GP gateway/portal cert refs."""
-        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{saxutils.escape(vsys)}']"
+        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{_xpath_str(vsys)}']"
         hits = []
         for gp_type in ("global-protect/global-protect-gateway/entry", "global-protect/global-protect-portal/entry"):
             try:
@@ -299,7 +305,7 @@ class PanosClient:
                 gw_name = entry.get("name", "")
                 for ssl_el in entry.findall(".//ssl-tls-service-profile"):
                     if ssl_el.text == old_cert:
-                        full_xpath = f"{base}/{gp_type}[@name='{saxutils.escape(gw_name)}']/ssl-tls-service-profile"
+                        full_xpath = f"{base}/{gp_type}[@name='{_xpath_str(gw_name)}']/ssl-tls-service-profile"
                         hits.append((f"{gp_type}/{gw_name}", full_xpath))
         return hits
 
@@ -310,7 +316,7 @@ class PanosClient:
         action=set with element <cookie-encrypt-decrypt-cert>...</cookie-encrypt-decrypt-cert>
         replaces the text value correctly.
         """
-        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{saxutils.escape(vsys)}']"
+        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{_xpath_str(vsys)}']"
         hits = []
         for gp_type in ("global-protect/global-protect-portal/entry", "global-protect/global-protect-gateway/entry"):
             try:
@@ -324,8 +330,8 @@ class PanosClient:
                     for cookie_el in cfg_entry.findall("authentication-override/cookie-encrypt-decrypt-cert"):
                         if cookie_el.text == old_cert:
                             auth_xpath = (
-                                f"{base}/{gp_type}[@name='{saxutils.escape(gp_name)}']"
-                                f"/client-config/configs/entry[@name='{saxutils.escape(cfg_name)}']"
+                                f"{base}/{gp_type}[@name='{_xpath_str(gp_name)}']"
+                                f"/client-config/configs/entry[@name='{_xpath_str(cfg_name)}']"
                                 f"/authentication-override"
                             )
                             hits.append({
@@ -337,7 +343,7 @@ class PanosClient:
 
     def find_decrypt_refs(self, vsys: str, old_cert: str) -> list[tuple[str, str]]:
         """Return list of (label, xpath) for SSL decryption cert refs."""
-        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{saxutils.escape(vsys)}']/ssl-decrypt"
+        base = f"/config/devices/entry[@name='localhost.localdomain']/vsys/entry[@name='{_xpath_str(vsys)}']/ssl-decrypt"
         hits = []
         for field in ("forward-trust-certificate-rsa", "forward-untrust-certificate-rsa",
                       "forward-trust-certificate-ecdsa", "forward-untrust-certificate-ecdsa"):
@@ -392,7 +398,7 @@ class PanosClient:
                 continue
             ca_names = [e.get("name") for e in ca_el.findall("entry") if e.get("name")]
             if old_cert in ca_names:
-                safe_n = saxutils.escape(name)
+                safe_n = _xpath_str(name)
                 matches.append({
                     "name": name,
                     "ca_names": ca_names,
@@ -406,7 +412,7 @@ class PanosClient:
         Returns True if deleted, False if not found in either scope.
         """
         dev_base = "/config/devices/entry[@name='localhost.localdomain']"
-        safe_name = saxutils.escape(cert_name)
+        safe_name = _xpath_str(cert_name)
         for scope, xpath in [
             ("vsys1", f"{dev_base}/vsys/entry[@name='vsys1']/certificate/entry[@name='{safe_name}']"),
             ("shared", f"/config/shared/certificate/entry[@name='{safe_name}']"),
@@ -604,13 +610,13 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
     dev_base = "/config/devices/entry[@name='localhost.localdomain']"
 
     for vsys in vsys_list:
-        vsys_base = f"{dev_base}/vsys/entry[@name='{saxutils.escape(vsys)}']"
+        vsys_base = f"{dev_base}/vsys/entry[@name='{_xpath_str(vsys)}']"
 
         # SSL/TLS service profiles in vsys
         xpath = f"{vsys_base}/ssl-tls-service-profile"
         names = client.find_ssl_profile_refs(xpath, old_name)
         for n in names:
-            safe_n = saxutils.escape(n)
+            safe_n = _xpath_str(n)
             refs["ssl_tls_profiles"].append({
                 "scope": f"vsys/{vsys}",
                 "vsys": vsys,
@@ -621,7 +627,7 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         # Certificate profiles (CA lists for mTLS)
         cp_xpath = f"{vsys_base}/certificate-profile"
         for r in client.find_cert_profile_refs(cp_xpath, old_name):
-            safe_n = saxutils.escape(r["name"])
+            safe_n = _xpath_str(r["name"])
             refs["cert_profiles"].append({
                 "scope": f"vsys/{vsys}",
                 "vsys": vsys,
@@ -646,7 +652,7 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
     shared_xpath = "/config/shared/ssl-tls-service-profile"
     names = client.find_ssl_profile_refs(shared_xpath, old_name)
     for n in names:
-        safe_n = saxutils.escape(n)
+        safe_n = _xpath_str(n)
         refs["ssl_tls_profiles"].append({
             "scope": "shared",
             "vsys": None,
