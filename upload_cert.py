@@ -202,6 +202,17 @@ class PanosClient:
                 raise
         time.sleep(self.SET_CALL_DELAY_S)
 
+    def edit_config(self, xpath: str, element_xml: str) -> None:
+        """Replace the element at xpath entirely (action=edit, not additive like action=set)."""
+        root = self._get({
+            "type": "config",
+            "action": "edit",
+            "xpath": xpath,
+            "element": element_xml,
+        })
+        self._check_status(root, f"edit config {xpath}")
+        time.sleep(self.SET_CALL_DELAY_S)
+
     def cert_exists(self, vsys_xpath: str, cert_name: str) -> bool:
         safe_name = saxutils.escape(cert_name)
         xpath = f"{vsys_xpath}/certificate/entry[@name='{safe_name}']"
@@ -273,6 +284,25 @@ class PanosClient:
                 name = entry.get("name")
                 if name:
                     matches.append(name)
+        return matches
+
+    def find_cert_profile_refs(self, xpath: str, old_cert: str) -> list[dict]:
+        """Return list of {name, ca_names} for certificate-profiles containing old_cert in their CA list."""
+        try:
+            root = self.get_config(xpath)
+        except PanosError:
+            return []
+        matches = []
+        for entry in root.findall(".//entry"):
+            name = entry.get("name")
+            if not name:
+                continue
+            ca_el = entry.find("CA")
+            if ca_el is None:
+                continue
+            ca_names = [e.get("name") for e in ca_el.findall("entry") if e.get("name")]
+            if old_cert in ca_names:
+                matches.append({"name": name, "ca_names": ca_names})
         return matches
 
     def find_gp_refs(self, vsys: str, old_cert: str) -> list[tuple[str, str]]:
@@ -520,6 +550,7 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
     """Return a structured dict of all places old_name is referenced."""
     refs = {
         "ssl_tls_profiles": [],   # list of {scope, vsys, name, set_xpath}
+        "cert_profiles": [],       # list of {scope, vsys, name, ca_names, entry_xpath}
         "gp": [],                  # list of {vsys, label, set_xpath}
         "ssl_decrypt": [],         # list of {vsys, label, set_xpath}
         "device_mgmt": None,       # set_xpath or None
@@ -549,6 +580,18 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
                 "vsys": vsys,
                 "name": n,
                 "set_xpath": f"{vsys_base}/ssl-tls-service-profile/entry[@name='{safe_n}']",
+            })
+
+        # Certificate profiles (CA lists for mTLS)
+        cp_xpath = f"{vsys_base}/certificate-profile"
+        for r in client.find_cert_profile_refs(cp_xpath, old_name):
+            safe_n = saxutils.escape(r["name"])
+            refs["cert_profiles"].append({
+                "scope": f"vsys/{vsys}",
+                "vsys": vsys,
+                "name": r["name"],
+                "ca_names": r["ca_names"],
+                "entry_xpath": f"{cp_xpath}/entry[@name='{safe_n}']",
             })
 
         # GlobalProtect
@@ -689,6 +732,7 @@ def main():
 
         total_refs = (
             len(refs["ssl_tls_profiles"]) +
+            len(refs["cert_profiles"]) +
             len(refs["gp"]) +
             len(refs["ssl_decrypt"]) +
             len(refs["cert_profiles"]) +
@@ -698,6 +742,8 @@ def main():
         logger.info("--- Discovery results ---")
         for r in refs["ssl_tls_profiles"]:
             logger.info("  SSL/TLS profile [%s] '%s'", r["scope"], r["name"])
+        for r in refs["cert_profiles"]:
+            logger.info("  Certificate profile [%s] '%s' (CA list: %s)", r["scope"], r["name"], r["ca_names"])
         for r in refs["gp"]:
             logger.info("  GlobalProtect [vsys/%s] %s", r["vsys"], r["label"])
         for r in refs["ssl_decrypt"]:
@@ -749,6 +795,19 @@ def main():
                 client.set_config(r["set_xpath"], cert_element)
                 remapped.append(r["set_xpath"])
                 logger.info("Remapped SSL/TLS profile [%s] '%s'.", r["scope"], r["name"])
+
+            # Certificate profiles use a multi-entry CA list — must use edit_config (action=edit)
+            # so the entire <CA> block is replaced, not merged additively like action=set would do.
+            for r in refs["cert_profiles"]:
+                new_ca_names = [args.new_name if n == args.old_name else n for n in r["ca_names"]]
+                ca_el = ET.Element("CA")
+                for n in new_ca_names:
+                    e = ET.SubElement(ca_el, "entry")
+                    e.set("name", saxutils.escape(n))
+                ca_xpath = r["entry_xpath"] + "/CA"
+                client.edit_config(ca_xpath, ET.tostring(ca_el, encoding="unicode"))
+                remapped.append(r["entry_xpath"])
+                logger.info("Remapped certificate profile [%s] '%s'.", r["scope"], r["name"])
 
             for r in refs["gp"]:
                 client.set_config(r["set_xpath"], cert_element)
