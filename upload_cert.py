@@ -508,7 +508,12 @@ class PanosClient:
 # Certificate / key validation
 # ---------------------------------------------------------------------------
 
-def validate_cert_and_key(cert_path: Path, key_path: Path | None, logger: logging.Logger) -> None:
+def validate_cert_and_key(
+    cert_path: Path,
+    key_path: Path | None,
+    logger: logging.Logger,
+    key_passphrase: bytes | None = None,
+) -> None:
     if not CRYPTO_AVAILABLE:
         logger.warning("'cryptography' library not installed — skipping cert/key validation.")
         return
@@ -555,7 +560,15 @@ def validate_cert_and_key(cert_path: Path, key_path: Path | None, logger: loggin
     # Load key
     try:
         key_pem = key_path.read_bytes()
-        private_key = load_pem_private_key(key_pem, password=None)
+        private_key = load_pem_private_key(key_pem, password=key_passphrase)
+    except TypeError:
+        # cryptography raises TypeError when the wrong passphrase is given
+        msg = (
+            f"ERROR: Cannot parse key file '{key_path}': wrong passphrase."
+            if key_passphrase is not None
+            else f"ERROR: Cannot parse key file '{key_path}': key is encrypted — provide --key-passphrase."
+        )
+        raise SystemExit(msg)
     except Exception as e:
         raise SystemExit(f"ERROR: Cannot parse key file '{key_path}': {e}")
 
@@ -757,7 +770,8 @@ def main():
     if args.key and not args.key.exists():
         raise SystemExit(f"ERROR: Key file not found: {args.key}")
 
-    validate_cert_and_key(args.cert, args.key, logger)
+    passphrase_bytes = args.key_passphrase.encode() if args.key_passphrase else None
+    validate_cert_and_key(args.cert, args.key, logger, key_passphrase=passphrase_bytes)
 
     client = PanosClient(host, api_key, verify_ssl, logger)
 
