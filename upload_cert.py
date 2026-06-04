@@ -104,7 +104,14 @@ class PanosClient:
             return
         code = root.get("code", "unknown")
         msg_el = root.find(".//msg")
-        msg = msg_el.text if msg_el is not None else ET.tostring(root, encoding="unicode")
+        if msg_el is not None:
+            # Message may be direct text or nested in <line> children
+            msg = msg_el.text or " ".join(
+                (line.text or "").strip()
+                for line in msg_el.findall("line")
+            ) or ET.tostring(root, encoding="unicode")
+        else:
+            msg = ET.tostring(root, encoding="unicode")
         if code in ("403", "16") or "Invalid credentials" in (msg or "") or "Auth failed" in (msg or ""):
             raise PanosAuthError(
                 f"{operation} failed — API key rejected (code {code}). "
@@ -145,14 +152,23 @@ class PanosClient:
 
     def revert_candidate(self) -> None:
         try:
-            root = self._get({"type": "config", "action": "revert"})
+            root = self._get({"type": "op", "cmd": "<revert><config></config></revert>"})
             self._check_status(root, "revert candidate config")
             self._logger.info("Candidate config reverted to last committed state.")
         except Exception as e:
-            self._logger.error("Failed to revert candidate config: %s", e)
+            msg = str(e)
+            if "queued" in msg.lower() or "jobs" in msg.lower():
+                self._logger.error(
+                    "Could not auto-revert: a commit/validate job is still queued on the device. "
+                    "Wait for it to finish, then manually revert via: "
+                    "Device > Setup > Operations > Revert to last saved configuration."
+                )
+            else:
+                self._logger.error("Failed to revert candidate config: %s", e)
 
     def save_config_snapshot(self, name: str) -> None:
-        root = self._get({"type": "config", "action": "save", "src": "running", "dst": name})
+        safe_name = saxutils.escape(name)
+        root = self._get({"type": "op", "cmd": f"<save><config><to>{safe_name}</to></config></save>"})
         self._check_status(root, f"save snapshot '{name}'")
         self._logger.info("Running config saved as '%s' on device.", name)
 
@@ -168,7 +184,22 @@ class PanosClient:
             "xpath": xpath,
             "element": element_xml,
         })
-        self._check_status(root, f"set config {xpath}")
+        try:
+            self._check_status(root, f"set config {xpath}")
+        except PanosError as e:
+            if root.get("code") == "13" and "override" in str(e):
+                self._logger.warning(
+                    "Object at %s is template-managed; retrying with action=override.", xpath
+                )
+                root = self._get({
+                    "type": "config",
+                    "action": "override",
+                    "xpath": xpath,
+                    "element": element_xml,
+                })
+                self._check_status(root, f"override config {xpath}")
+            else:
+                raise
         time.sleep(self.SET_CALL_DELAY_S)
 
     def cert_exists(self, vsys_xpath: str, cert_name: str) -> bool:
@@ -184,26 +215,43 @@ class PanosClient:
     # Import
     # ------------------------------------------------------------------
 
-    def import_certificate(self, cert_name: str, pem_bytes: bytes) -> None:
+    def import_certificate(self, cert_name: str, cert_bytes: bytes) -> None:
+        """Import a certificate only (no private key)."""
         root = self._post(
             {"type": "import", "category": "certificate", "certificate-name": cert_name, "format": "pem"},
-            files={"file": ("cert.pem", pem_bytes, "application/x-pem-file")},
+            files={"file": ("cert.pem", cert_bytes, "application/x-pem-file")},
         )
         self._check_status(root, "import certificate")
         self._logger.info("Certificate '%s' imported.", cert_name)
 
-    def import_private_key(self, cert_name: str, key_bytes: bytes, passphrase: bytes | None = None) -> None:
-        files = {"file": ("key.pem", key_bytes, "application/x-pem-file")}
-        params = {"type": "import", "category": "private-key", "certificate-name": cert_name, "format": "pem"}
-        if passphrase:
-            params["passphrase"] = passphrase.decode()
-        root = self._post(params, files=files)
-        self._check_status(root, "import private key")
-        self._logger.info("Private key for '%s' imported.", cert_name)
+    def import_keypair(self, cert_name: str, cert_bytes: bytes, key_bytes: bytes, passphrase: bytes = b"") -> None:
+        """Import a certificate and private key together using category=keypair."""
+        combined = cert_bytes + b"\n" + key_bytes
+        root = self._post(
+            {
+                "type": "import",
+                "category": "keypair",
+                "certificate-name": cert_name,
+                "format": "pem",
+                "passphrase": passphrase.decode(),
+            },
+            files={"file": ("keypair.pem", combined, "application/x-pem-file")},
+        )
+        self._check_status(root, "import keypair")
+        self._logger.info("Certificate and private key '%s' imported.", cert_name)
 
     # ------------------------------------------------------------------
     # Discovery
     # ------------------------------------------------------------------
+
+    def is_multi_vsys(self) -> bool:
+        """Return True if multi-vsys is enabled on this device."""
+        try:
+            root = self._get({"type": "op", "cmd": "<show><system><info></info></system></show>"})
+            el = root.find(".//multi-vsys")
+            return el is not None and el.text == "on"
+        except Exception:
+            return True  # safe default: treat as multi-vsys
 
     def list_vsys(self) -> list[str]:
         try:
@@ -260,6 +308,33 @@ class PanosClient:
                 pass
         return hits
 
+    def find_cert_profile_refs(self, xpath: str, old_cert: str) -> list[dict]:
+        """Return list of {name, ca_names, set_xpath} for cert profiles whose CA list contains old_cert.
+
+        PAN-OS stores CA entries as <CA><entry name="cert-name"/></CA>.
+        """
+        try:
+            root = self.get_config(xpath)
+        except PanosError:
+            return []
+        matches = []
+        for entry in root.findall(".//entry"):
+            name = entry.get("name")
+            if not name:
+                continue
+            ca_el = entry.find("CA")
+            if ca_el is None:
+                continue
+            ca_names = [e.get("name") for e in ca_el.findall("entry") if e.get("name")]
+            if old_cert in ca_names:
+                safe_n = saxutils.escape(name)
+                matches.append({
+                    "name": name,
+                    "ca_names": ca_names,
+                    "entry_xpath": f"{xpath}/entry[@name='{safe_n}']",
+                })
+        return matches
+
     def find_device_mgmt_ref(self, old_cert: str) -> str | None:
         """Return xpath if the device mgmt SSL profile references old_cert, else None."""
         xpath = "/config/devices/entry[@name='localhost.localdomain']/deviceconfig/system/ssl-tls-service-profile"
@@ -276,13 +351,13 @@ class PanosClient:
     # Commit
     # ------------------------------------------------------------------
 
-    def validate_commit(self, admin: str | None = None) -> None:
+    def validate_commit(self, admin: str | None = None, timeout_s: int = 300) -> None:
         cmd = self._build_commit_cmd(validate=True, admin=admin)
         root = self._get({"type": "commit", "action": "validate", "cmd": cmd})
         self._check_status(root, "commit validate")
         job_id = self._extract_job_id(root)
         if job_id:
-            self._poll_job(job_id, "validate", timeout_s=120)
+            self._poll_job(job_id, "validate", timeout_s=timeout_s)
         self._logger.info("Pre-commit validation passed.")
 
     def commit(self, admin: str | None = None, timeout_s: int = 300) -> str:
@@ -426,10 +501,16 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         "gp": [],                  # list of {vsys, label, set_xpath}
         "ssl_decrypt": [],         # list of {vsys, label, set_xpath}
         "device_mgmt": None,       # set_xpath or None
+        "cert_profiles": [],       # list of {scope, vsys, name, ca_names, entry_xpath}
     }
 
-    vsys_list = client.list_vsys()
-    logger.info("Found vsys: %s", vsys_list)
+    multi_vsys = client.is_multi_vsys()
+    if multi_vsys:
+        vsys_list = client.list_vsys()
+        logger.info("Multi-vsys mode — scanning vsys: %s", vsys_list)
+    else:
+        vsys_list = ["vsys1"]
+        logger.info("Single vsys mode — scanning vsys1 directly")
 
     dev_base = "/config/devices/entry[@name='localhost.localdomain']"
 
@@ -456,6 +537,10 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         for label, set_xpath in client.find_decrypt_refs(vsys, old_name):
             refs["ssl_decrypt"].append({"vsys": vsys, "label": label, "set_xpath": set_xpath})
 
+        # Certificate profiles (vsys)
+        for r in client.find_cert_profile_refs(f"{vsys_base}/certificate-profile", old_name):
+            refs["cert_profiles"].append({"scope": f"vsys/{vsys}", "vsys": vsys, **r})
+
     # Shared SSL/TLS profiles
     shared_xpath = "/config/shared/ssl-tls-service-profile"
     names = client.find_ssl_profile_refs(shared_xpath, old_name)
@@ -467,6 +552,10 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
             "name": n,
             "set_xpath": f"{shared_xpath}/entry[@name='{safe_n}']",
         })
+
+    # Shared certificate profiles
+    for r in client.find_cert_profile_refs("/config/shared/certificate-profile", old_name):
+        refs["cert_profiles"].append({"scope": "shared", "vsys": None, **r})
 
     # Device management cert
     mgmt_xpath = client.find_device_mgmt_ref(old_name)
@@ -493,6 +582,9 @@ def parse_args():
     p.add_argument("--new-name", required=True, help="Cert object name to import AS (remap TO).")
     p.add_argument("--cert", required=True, type=Path, help="Path to PEM cert file.")
     p.add_argument("--key", type=Path, default=None, help="Path to PEM private key (leaf certs only).")
+    p.add_argument("--key-passphrase", default=None,
+                   help="Passphrase for keypair import. PAN-OS 11.x requires a non-empty value even for "
+                        "unencrypted keys. If omitted, a random passphrase is generated automatically.")
     p.add_argument("--dry-run", action="store_true", help="Discover and report; do not modify firewall.")
     p.add_argument("--force-overwrite", action="store_true",
                    help="Overwrite existing cert named --new-name if it already exists on the firewall.")
@@ -565,6 +657,7 @@ def main():
             len(refs["ssl_tls_profiles"]) +
             len(refs["gp"]) +
             len(refs["ssl_decrypt"]) +
+            len(refs["cert_profiles"]) +
             (1 if refs["device_mgmt"] else 0)
         )
 
@@ -575,6 +668,8 @@ def main():
             logger.info("  GlobalProtect [vsys/%s] %s", r["vsys"], r["label"])
         for r in refs["ssl_decrypt"]:
             logger.info("  SSL Decrypt [vsys/%s] %s", r["vsys"], r["label"])
+        for r in refs["cert_profiles"]:
+            logger.info("  Certificate profile [%s] '%s'", r["scope"], r["name"])
         if refs["device_mgmt"]:
             logger.info("  Device management SSL profile")
         if total_refs == 0:
@@ -584,9 +679,13 @@ def main():
             logger.info("DRY RUN complete. %d reference(s) would be remapped.", total_refs)
             return
 
-        # --- Acquire config lock ---
-        client.acquire_config_lock()
-        config_lock_held = True
+        # --- Acquire config lock (best-effort) ---
+        config_lock_held = False
+        try:
+            client.acquire_config_lock()
+            config_lock_held = True
+        except PanosError as e:
+            logger.warning("Config lock unavailable: %s — proceeding without lock.", e)
         snapshot_name = f"pre-cert-rotate-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
         changes_made = False
 
@@ -595,15 +694,18 @@ def main():
             client.save_config_snapshot(snapshot_name)
             logger.info("Pre-change snapshot saved: '%s'", snapshot_name)
 
-            # --- Import cert ---
+            # --- Import cert (and key if provided) ---
             cert_bytes = args.cert.read_bytes()
-            client.import_certificate(args.new_name, cert_bytes)
-            changes_made = True
-
-            # --- Import key ---
             if args.key:
+                import secrets as _secrets
+                passphrase = args.key_passphrase if args.key_passphrase is not None else _secrets.token_hex(15)
+                if args.key_passphrase is None:
+                    logger.info("No --key-passphrase provided; using auto-generated passphrase for keypair import.")
                 key_bytes = args.key.read_bytes()
-                client.import_private_key(args.new_name, key_bytes)
+                client.import_keypair(args.new_name, cert_bytes, key_bytes, passphrase=passphrase.encode())
+            else:
+                client.import_certificate(args.new_name, cert_bytes)
+            changes_made = True
 
             # --- Remap ---
             cert_element = build_cert_element(args.new_name)
@@ -624,6 +726,16 @@ def main():
                 remapped.append(r["set_xpath"])
                 logger.info("Remapped SSL decrypt field %s.", r["label"])
 
+            for r in refs["cert_profiles"]:
+                new_ca_names = [args.new_name if n == args.old_name else n for n in r["ca_names"]]
+                ca_el = ET.Element("CA")
+                for n in new_ca_names:
+                    e = ET.SubElement(ca_el, "entry")
+                    e.set("name", saxutils.escape(n))
+                client.set_config(r["entry_xpath"], ET.tostring(ca_el, encoding="unicode"))
+                remapped.append(r["entry_xpath"])
+                logger.info("Remapped certificate profile [%s] '%s'.", r["scope"], r["name"])
+
             if refs["device_mgmt"]:
                 client.set_config(refs["device_mgmt"], cert_element)
                 remapped.append(refs["device_mgmt"])
@@ -631,15 +743,14 @@ def main():
 
             # --- Pre-commit validation ---
             logger.info("Running pre-commit validation...")
-            client.validate_commit(admin=args.commit_admin)
+            client.validate_commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
 
             # --- Commit ---
             logger.info("Committing...")
             job_id = client.commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
 
             logger.info("--- Summary ---")
-            logger.info("Certificate imported: '%s'", args.new_name)
-            logger.info("Key imported: %s", "yes" if args.key else "no")
+            logger.info("Certificate imported: '%s' (with key: %s)", args.new_name, "yes" if args.key else "no")
             logger.info("Profiles remapped: %d", len(remapped))
             logger.info("Commit job ID: %s", job_id)
             logger.info("Pre-change snapshot on device: '%s'", snapshot_name)
