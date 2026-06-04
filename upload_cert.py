@@ -348,13 +348,13 @@ class PanosClient:
         ]:
             try:
                 check = self._get({"type": "config", "action": "get", "xpath": xpath})
-                if check.get("status") == "success" and check.find(".//entry") is not None:
-                    root = self._get({"type": "config", "action": "delete", "xpath": xpath})
-                    self._check_status(root, f"delete certificate '{cert_name}'")
-                    self._logger.info("Certificate '%s' deleted from %s.", cert_name, scope)
-                    return True
             except PanosError:
                 continue
+            if check.get("status") == "success" and check.find(".//entry") is not None:
+                root = self._get({"type": "config", "action": "delete", "xpath": xpath})
+                self._check_status(root, f"delete certificate '{cert_name}'")
+                self._logger.info("Certificate '%s' deleted from %s.", cert_name, scope)
+                return True
         return False
 
     def find_device_mgmt_ref(self, old_cert: str) -> str | None:
@@ -776,20 +776,24 @@ def main():
                 logger.info("Remapped device management SSL profile.")
 
             if not auto_commit:
-                # --- Staged mode: leave candidate config for manual review ---
+                # --- Staged mode: stage everything for a single manual review + commit ---
+                if args.remove_old_cert:
+                    logger.info("Staging deletion of old certificate '%s'...", args.old_name)
+                    found = client.delete_certificate(args.old_name)
+                    if not found:
+                        logger.warning(
+                            "Old certificate '%s' not found in vsys1 or shared — may have already been removed.",
+                            args.old_name,
+                        )
+
                 logger.info("--- Staged (PANOS_AUTO_COMMIT=false / --no-commit) ---")
                 logger.info("Certificate imported: '%s' (with key: %s)", args.new_name, "yes" if args.key else "no")
                 logger.info("Profiles remapped: %d", len(remapped))
                 logger.info("Pre-change snapshot on device: '%s'", snapshot_name)
                 logger.info(
-                    "Changes are staged in candidate config. Review in PAN-OS GUI "
+                    "All changes are staged in candidate config. Review in PAN-OS GUI "
                     "(Monitor > Commit > Preview) then commit manually."
                 )
-                if args.remove_old_cert:
-                    logger.warning(
-                        "--remove-old-cert has no effect in staged mode. "
-                        "Delete '%s' manually after you commit.", args.old_name
-                    )
                 if log_file:
                     logger.info("Full audit log: %s", log_file)
             else:
@@ -816,6 +820,10 @@ def main():
                             "Old certificate '%s' not found in vsys1 or shared — may have already been removed.",
                             args.old_name,
                         )
+                    else:
+                        logger.info("Committing certificate deletion...")
+                        cleanup_job_id = client.commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
+                        logger.info("Certificate deletion commit job ID: %s", cleanup_job_id)
 
         except (PanosError, Exception) as e:
             logger.error("ERROR during live run: %s", e)
