@@ -271,8 +271,13 @@ class PanosClient:
     def list_vsys(self) -> list[str]:
         try:
             root = self.get_config("/config/devices/entry[@name='localhost.localdomain']/vsys")
-            return [e.get("name") for e in root.findall(".//vsys/entry") if e.get("name")]
-        except Exception:
+            vsys = [e.get("name") for e in root.findall(".//vsys/entry") if e.get("name")]
+            return vsys or ["vsys1"]
+        except Exception as e:
+            self._logger.warning(
+                "Could not enumerate vsys (falling back to vsys1 only): %s — "
+                "cert refs in other vsys will NOT be discovered or remapped.", e
+            )
             return ["vsys1"]
 
     def find_ssl_profile_refs(self, xpath: str, old_cert: str) -> list[str]:
