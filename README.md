@@ -27,6 +27,8 @@ Designed for homelab and small-team production use where you rotate certs on a s
 - Supports **admin-scoped commits** (`--commit-admin`) so the commit only includes your changes, not other in-progress admin work
 - Guards against **overwriting an existing cert** unless `--force-overwrite` is explicitly passed
 - Validates the cert and key **before** any API call: expiry, cert↔key pair match, key file permissions
+- Detects **API key rejection** and tells you to regenerate — keys are invalidated whenever the admin account's password changes
+- Throttles bulk set calls at **100 ms intervals** to avoid overloading the management plane
 - All cert names are **XML/XPath-escaped** before use in API calls — no injection surface
 
 ---
@@ -248,6 +250,7 @@ Dry runs log to stdout only.
 
 - **Panorama-managed firewalls:** Changes made directly to a firewall managed by Panorama may be overwritten on the next Panorama push. Run this against Panorama's API or push the cert via Panorama templates instead.
 - **Certificate profiles (mTLS):** Cert profiles that reference CA certs for client authentication are not remapped — those reference CA certs by name and typically don't need updating when rotating a leaf cert. If you're rotating a CA cert that's referenced in cert profiles, update those manually.
+- **Chain / full-chain PEM files:** If your cert file contains multiple certificates (e.g. a full chain from Let's Encrypt or Step-CA), the tool warns and imports only the first (leaf) certificate. The intermediate and root certs are ignored — PAN-OS handles its own trust chain separately. Import intermediates/roots as separate cert objects if needed.
 - **PKCS#12 / DER format:** Only PEM input is supported. Convert first: `openssl pkcs12 -in cert.p12 -out cert.pem -nodes`
 
 ---
