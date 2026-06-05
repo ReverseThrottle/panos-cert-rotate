@@ -424,17 +424,19 @@ class PanosClient:
                 })
         return matches
 
-    def delete_certificate(self, cert_name: str) -> bool:
-        """Delete a certificate by name; searches vsys then shared scope.
+    def delete_certificate(self, cert_name: str, vsys_list: list[str] | None = None) -> bool:
+        """Delete a certificate by name; searches all vsys scopes then shared.
 
-        Returns True if deleted, False if not found in either scope.
+        Returns True if deleted, False if not found in any scope.
         """
         dev_base = "/config/devices/entry[@name='localhost.localdomain']"
         safe_name = _xpath_str(cert_name)
-        for scope, xpath in [
-            ("vsys1", f"{dev_base}/vsys/entry[@name='vsys1']/certificate/entry[@name='{safe_name}']"),
-            ("shared", f"/config/shared/certificate/entry[@name='{safe_name}']"),
-        ]:
+        scopes = [
+            (vsys, f"{dev_base}/vsys/entry[@name='{_xpath_str(vsys)}']/certificate/entry[@name='{safe_name}']")
+            for vsys in (vsys_list or ["vsys1"])
+        ]
+        scopes.append(("shared", f"/config/shared/certificate/entry[@name='{safe_name}']"))
+        for scope, xpath in scopes:
             try:
                 check = self._get({"type": "config", "action": "get", "xpath": xpath})
             except PanosError:
@@ -624,6 +626,7 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
         "ssl_decrypt": [],         # list of {vsys, label, set_xpath}
         "shared_ssl_decrypt": [],  # list of {label, set_xpath, element_tag} — shared forward-trust
         "device_mgmt": None,       # set_xpath or None
+        "vsys_list": [],           # all vsys discovered during scan
     }
 
     multi_vsys = client.is_multi_vsys()
@@ -633,6 +636,8 @@ def collect_all_refs(client: PanosClient, old_name: str, logger: logging.Logger)
     else:
         vsys_list = ["vsys1"]
         logger.info("Single vsys mode — scanning vsys1 directly")
+
+    refs["vsys_list"] = vsys_list
 
     dev_base = "/config/devices/entry[@name='localhost.localdomain']"
 
@@ -917,10 +922,10 @@ def main():
                 # --- Staged mode: stage everything for a single manual review + commit ---
                 if args.remove_old_cert:
                     logger.info("Staging deletion of old certificate '%s'...", args.old_name)
-                    found = client.delete_certificate(args.old_name)
+                    found = client.delete_certificate(args.old_name, vsys_list=refs["vsys_list"])
                     if not found:
                         logger.warning(
-                            "Old certificate '%s' not found in vsys1 or shared — may have already been removed.",
+                            "Old certificate '%s' not found in any vsys or shared scope — may have already been removed.",
                             args.old_name,
                         )
 
@@ -952,10 +957,10 @@ def main():
 
                 if args.remove_old_cert:
                     logger.info("Removing old certificate '%s' from device...", args.old_name)
-                    found = client.delete_certificate(args.old_name)
+                    found = client.delete_certificate(args.old_name, vsys_list=refs["vsys_list"])
                     if not found:
                         logger.warning(
-                            "Old certificate '%s' not found in vsys1 or shared — may have already been removed.",
+                            "Old certificate '%s' not found in any vsys or shared scope — may have already been removed.",
                             args.old_name,
                         )
                     else:
