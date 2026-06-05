@@ -177,6 +177,8 @@ The tool dynamically enumerates all vsys on the device and checks every known lo
 | GlobalProtect portal | `.../vsys/entry/global-protect-portal/entry/...` |
 | SSL decryption (forward trust RSA/ECDSA) | `.../vsys/entry/ssl-decrypt/forward-trust-certificate-*` |
 | SSL decryption (forward untrust RSA/ECDSA) | `.../vsys/entry/ssl-decrypt/forward-untrust-certificate-*` |
+| SSL decryption shared (forward trust RSA/ECDSA) | `/config/shared/ssl-decrypt/forward-trust-certificate/{rsa,ecdsa}` |
+| SSL decryption shared (forward untrust RSA/ECDSA) | `/config/shared/ssl-decrypt/forward-untrust-certificate/{rsa,ecdsa}` |
 | Device management | `.../deviceconfig/system/ssl-tls-service-profile` |
 
 ---
