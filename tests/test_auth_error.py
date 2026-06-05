@@ -22,11 +22,11 @@ _AUTH_ERR_MSG = (
 _EMPTY_REFS = {
     "ssl_tls_profiles": [],
     "cert_profiles": [],
-    "gp": [],
     "gp_cookie": [],
     "ssl_decrypt": [],
     "shared_ssl_decrypt": [],
     "device_mgmt": None,
+    "vsys_list": [],
 }
 
 
