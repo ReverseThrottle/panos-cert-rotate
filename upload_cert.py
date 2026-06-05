@@ -941,6 +941,10 @@ def main():
                         cleanup_job_id = client.commit(admin=args.commit_admin, timeout_s=args.commit_timeout)
                         logger.info("Certificate deletion commit job ID: %s", cleanup_job_id)
 
+        except PanosAuthError:
+            if config_lock_held:
+                client.release_config_lock()
+            raise
         except (PanosError, Exception) as e:
             logger.error("ERROR during live run: %s", e)
             if changes_made:
